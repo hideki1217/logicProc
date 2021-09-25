@@ -1,0 +1,187 @@
+{
+  "creator": "Yosys 0.8 (git sha1 5706e90)",
+  "modules": {
+    "full_adder": {
+      "attributes": {
+        "src": "sample.v:1"
+      },
+      "ports": {
+        "xin": {
+          "direction": "input",
+          "bits": [ 2 ]
+        },
+        "yin": {
+          "direction": "input",
+          "bits": [ 3 ]
+        },
+        "cin": {
+          "direction": "input",
+          "bits": [ 4 ]
+        },
+        "sout": {
+          "direction": "output",
+          "bits": [ 5 ]
+        },
+        "cout": {
+          "direction": "output",
+          "bits": [ 6 ]
+        }
+      },
+      "cells": {
+        "$auto$simplemap.cc:85:simplemap_bitop$51": {
+          "hide_name": 1,
+          "type": "$_XOR_",
+          "parameters": {
+          },
+          "attributes": {
+            "src": "sample.v:4"
+          },
+          "port_directions": {
+            "A": "input",
+            "B": "input",
+            "Y": "output"
+          },
+          "connections": {
+            "A": [ 7 ],
+            "B": [ 4 ],
+            "Y": [ 5 ]
+          }
+        },
+        "$auto$simplemap.cc:85:simplemap_bitop$52": {
+          "hide_name": 1,
+          "type": "$_AND_",
+          "parameters": {
+          },
+          "attributes": {
+            "src": "sample.v:5"
+          },
+          "port_directions": {
+            "A": "input",
+            "B": "input",
+            "Y": "output"
+          },
+          "connections": {
+            "A": [ 2 ],
+            "B": [ 3 ],
+            "Y": [ 8 ]
+          }
+        },
+        "$auto$simplemap.cc:85:simplemap_bitop$53": {
+          "hide_name": 1,
+          "type": "$_XOR_",
+          "parameters": {
+          },
+          "attributes": {
+            "src": "sample.v:5"
+          },
+          "port_directions": {
+            "A": "input",
+            "B": "input",
+            "Y": "output"
+          },
+          "connections": {
+            "A": [ 2 ],
+            "B": [ 3 ],
+            "Y": [ 7 ]
+          }
+        },
+        "$auto$simplemap.cc:85:simplemap_bitop$54": {
+          "hide_name": 1,
+          "type": "$_AND_",
+          "parameters": {
+          },
+          "attributes": {
+            "src": "sample.v:5"
+          },
+          "port_directions": {
+            "A": "input",
+            "B": "input",
+            "Y": "output"
+          },
+          "connections": {
+            "A": [ 7 ],
+            "B": [ 4 ],
+            "Y": [ 9 ]
+          }
+        },
+        "$auto$simplemap.cc:85:simplemap_bitop$55": {
+          "hide_name": 1,
+          "type": "$_OR_",
+          "parameters": {
+          },
+          "attributes": {
+            "src": "sample.v:5"
+          },
+          "port_directions": {
+            "A": "input",
+            "B": "input",
+            "Y": "output"
+          },
+          "connections": {
+            "A": [ 8 ],
+            "B": [ 9 ],
+            "Y": [ 6 ]
+          }
+        }
+      },
+      "netnames": {
+        "$and$sample.v:5$3_Y": {
+          "hide_name": 1,
+          "bits": [ 8 ],
+          "attributes": {
+            "src": "sample.v:5"
+          }
+        },
+        "$and$sample.v:5$5_Y": {
+          "hide_name": 1,
+          "bits": [ 9 ],
+          "attributes": {
+            "src": "sample.v:5"
+          }
+        },
+        "$xor$sample.v:4$1_Y": {
+          "hide_name": 1,
+          "bits": [ 7 ],
+          "attributes": {
+            "src": "sample.v:4"
+          }
+        },
+        "cin": {
+          "hide_name": 0,
+          "bits": [ 4 ],
+          "attributes": {
+            "src": "sample.v:2"
+          }
+        },
+        "cout": {
+          "hide_name": 0,
+          "bits": [ 6 ],
+          "attributes": {
+            "src": "sample.v:3"
+          }
+        },
+        "sout": {
+          "hide_name": 0,
+          "bits": [ 5 ],
+          "attributes": {
+            "src": "sample.v:3"
+          }
+        },
+        "xin": {
+          "hide_name": 0,
+          "bits": [ 2 ],
+          "attributes": {
+            "src": "sample.v:2"
+          }
+        },
+        "yin": {
+          "hide_name": 0,
+          "bits": [ 3 ],
+          "attributes": {
+            "src": "sample.v:2"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+read_verilog sample.v
+hierarchy
+proc; opt
+techmap; opt
+write_verilog sample_res.v
+json -o sample_res.json
+clean
