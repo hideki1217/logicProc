@@ -1,6 +1,6 @@
-module full_adder (xin, yin, cin, sout, cout);
- input xin, yin, cin;
- output sout, cout;
- assign sout = (xin ^ yin) ^ cin;
- assign cout = (xin & yin) | ((xin ^ yin) & cin);
+module full_adder (A,B,X,carry);
+ input [3:0] A, B;
+ output [3:0] X;
+ output carry;
+ assign {carry,X} = A + B;
 endmodule
