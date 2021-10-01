@@ -1,15 +1,19 @@
+#![feature(async_stream)]
 extern crate num;
 extern crate serde;
+extern crate tokio_dagtask;
 
 pub mod yosys_parse;
 
 use std::{
+    collections::HashMap,
     future::Future,
     pin::Pin,
     sync::{Arc, RwLock, RwLockReadGuard},
 };
-
-use yosys_parse::YosysRootElem;
+use tokio_dagtask::TaskGraph;
+use tokio_stream::{Stream, StreamExt};
+use yosys_parse::{WireId, YosysRootElem};
 
 use traits::LogicOps;
 pub mod traits {
@@ -32,67 +36,73 @@ type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// - Wire: マルチスレッドでもone:multiでのイミュータブルデータ共有をする
 /// - Node: culc()でoutに計算結果を流す
 pub struct Circuit<T> {
-    output: Vec<WireOut<T>>,
-    input: Vec<WireIn<T>>,
+    output: Vec<(WireId, WireOut<T>)>,
+    input: Vec<(WireId, WireIn<T>)>,
+    engine: TaskGraph<BoxFuture<()>>,
 }
 impl<T> Circuit<T> {
-    pub fn set_input(&mut self, index: usize, val: Box<T>) -> Result<Option<Box<T>>, &'static str> {
-        self.input.get_mut(index).unwrap().write(val)
+    pub fn set_input(&mut self, id: WireId, val: Box<T>) -> Result<Option<Box<T>>, &'static str> {
+        let i = self
+            .input
+            .binary_search_by_key(&id, |(x, _)| *x)
+            .map_err(|_| "selected id is not found")?;
+        let (_, wire) = self.input.get_mut(i).unwrap();
+        wire.write(val)
     }
-    pub fn culc_async(self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>
+    pub fn get_output(&mut self, id: WireId) -> Result<Option<Box<T>>, &'static str> {
+        let i = self
+            .output
+            .binary_search_by_key(&id, |(x, _)| *x)
+            .map_err(|_| "selected id is not found")?;
+        let (_, wire) = self.output.get_mut(i).unwrap();
+        Ok(wire.read_and_clear()?)
+    }
+    pub fn culc_async(self) -> BoxFuture<()>
     where
         T: LogicOps + Send + Sync + 'static,
     {
-        todo!()
+        let (_, exec) = self.engine.execute();
+        Box::pin(async move {
+            exec.collect::<Vec<_>>().await;
+        })
     }
     pub fn from_yosys(json: &str) -> Option<Self>
     where
-        T: LogicOps,
+        T: LogicOps + Send + Sync + 'static,
     {
         let yosys = YosysRootElem::from_json(json)?;
         let (_, module) = yosys.modules.iter().last().unwrap();
 
-        let n = {
-            module
-                .netnames
-                .iter()
-                .flat_map(|(_, n)| n.bits.iter())
-                .map(|x| *x)
-                .max()
-                .unwrap() as usize
-        } + 1;
-
-        let mut input: Vec<WireIn<T>> = Vec::new();
-        let mut output: Vec<WireOut<T>> = Vec::new();
+        let mut input: Vec<(WireId, WireIn<T>)> = Vec::new();
+        let mut output: Vec<(WireId, WireOut<T>)> = Vec::new();
         let mut output_id: Vec<u32> = Vec::new();
-        let mut input_id: Vec<u32> = Vec::new();
-        unsafe {
-            let mut nodes: Vec<CircuitNode<T>> = Vec::with_capacity(n);
-            nodes.set_len(n);
 
-            // nodesにCircuitNodeをセット
-            for (_, port) in module.ports.iter() {
-                match port.direction {
-                    yosys_parse::Direction::In => {
-                        for &id in port.bits.iter() {
-                            let node = CircuitNode::PortNode(Default::default());
-                            nodes[id as usize] = node;
-                            input_id.push(id);
-                        }
-                    }
-                    yosys_parse::Direction::Out => {
-                        for &id in port.bits.iter() {
-                            output_id.push(id);
-                        }
-                    }
-                    yosys_parse::Direction::InOut => {
-                        panic!("inout is not supported");
+        let mut nodes: HashMap<u32, CircuitNode<T>> = HashMap::new();
+
+        // nodesにCircuitNodeをセット
+        for (_, port) in module.ports.iter() {
+            match port.direction {
+                yosys_parse::Direction::In => {
+                    for &id in port.bits.iter() {
+                        input.push((id, Default::default()));
                     }
                 }
+                yosys_parse::Direction::Out => {
+                    for &id in port.bits.iter() {
+                        output_id.push(id);
+                    }
+                }
+                yosys_parse::Direction::InOut => {
+                    panic!("inout is not supported");
+                }
             }
-            for (_, cell) in module.cells.iter() {
-                let out_id = cell.output_wireid() as usize;
-                nodes[out_id] = match cell.type_name {
+        }
+        input.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap());
+        for (_, cell) in module.cells.iter() {
+            let out_id = cell.output_wireid();
+            nodes.insert(
+                out_id,
+                match cell.type_name {
                     yosys_parse::CellType::And => {
                         CircuitNode::AndNode(None, None, Default::default())
                     }
@@ -112,115 +122,199 @@ impl<T> Circuit<T> {
                         CircuitNode::NxorNode(None, None, Default::default())
                     }
                     yosys_parse::CellType::Not => CircuitNode::NotNode(None, Default::default()),
-                }
-            }
-            // 各ノードの入力部をセット
-            for (_, cell) in module.cells.iter() {
-                let out_id = cell.output_wireid() as usize;
-                let in_ids = cell.input_wireids();
-                match cell.type_name {
-                    yosys_parse::CellType::And => {
-                        let in0_out = nodes[in_ids[0] as usize].out_wire();
-                        let in1_out = nodes[in_ids[1] as usize].out_wire();
-                        if let CircuitNode::AndNode(in0, in1, _) = nodes.get_mut(out_id).unwrap() {
-                            in0.replace(in0_out);
-                            in1.replace(in1_out);
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                    yosys_parse::CellType::Nand => {
-                        let in0_out = nodes[in_ids[0] as usize].out_wire();
-                        let in1_out = nodes[in_ids[1] as usize].out_wire();
-                        if let CircuitNode::NandNode(in0, in1, _) = nodes.get_mut(out_id).unwrap() {
-                            in0.replace(in0_out);
-                            in1.replace(in1_out);
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                    yosys_parse::CellType::Or => {
-                        let in0_out = nodes[in_ids[0] as usize].out_wire();
-                        let in1_out = nodes[in_ids[1] as usize].out_wire();
-                        if let CircuitNode::OrNode(in0, in1, _) = nodes.get_mut(out_id).unwrap() {
-                            in0.replace(in0_out);
-                            in1.replace(in1_out);
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                    yosys_parse::CellType::Nor => {
-                        let in0_out = nodes[in_ids[0] as usize].out_wire();
-                        let in1_out = nodes[in_ids[1] as usize].out_wire();
-                        if let CircuitNode::NorNode(in0, in1, _) = nodes.get_mut(out_id).unwrap() {
-                            in0.replace(in0_out);
-                            in1.replace(in1_out);
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                    yosys_parse::CellType::Xor => {
-                        let in0_out = nodes[in_ids[0] as usize].out_wire();
-                        let in1_out = nodes[in_ids[1] as usize].out_wire();
-                        if let CircuitNode::XorNode(in0, in1, _) = nodes.get_mut(out_id).unwrap() {
-                            in0.replace(in0_out);
-                            in1.replace(in1_out);
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                    yosys_parse::CellType::Nxor => {
-                        let in0_out = nodes[in_ids[0] as usize].out_wire();
-                        let in1_out = nodes[in_ids[1] as usize].out_wire();
-                        if let CircuitNode::NxorNode(in0, in1, _) = nodes.get_mut(out_id).unwrap() {
-                            in0.replace(in0_out);
-                            in1.replace(in1_out);
-                        } else {
-                            unreachable!()
-                        }
-                    }
-                    yosys_parse::CellType::Not => {
-                        let in0_out = nodes[in_ids[0] as usize].out_wire();
-                        if let CircuitNode::NotNode(in0, _) = nodes.get_mut(out_id).unwrap() {
-                            in0.replace(in0_out);
-                        } else {
-                            unreachable!()
-                        }
+                },
+            );
+        }
+        // 各ノードの入力部をセット
+        for (_, cell) in module.cells.iter() {
+            let out_id = cell.output_wireid();
+            let in_ids = cell.input_wireids();
+            match cell.type_name {
+                yosys_parse::CellType::And => {
+                    let in0_out = nodes.get(&in_ids[0]).map_or(
+                        input[input.binary_search_by_key(&in_ids[0], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    let in1_out = nodes.get(&in_ids[1]).map_or(
+                        input[input.binary_search_by_key(&in_ids[1], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    if let CircuitNode::AndNode(in0, in1, _) = nodes.get_mut(&out_id).unwrap() {
+                        in0.replace(in0_out);
+                        in1.replace(in1_out);
+                    } else {
+                        unreachable!()
                     }
                 }
+                yosys_parse::CellType::Nand => {
+                    let in0_out = nodes.get(&in_ids[0]).map_or(
+                        input[input.binary_search_by_key(&in_ids[0], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    let in1_out = nodes.get(&in_ids[1]).map_or(
+                        input[input.binary_search_by_key(&in_ids[1], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    if let CircuitNode::NandNode(in0, in1, _) = nodes.get_mut(&out_id).unwrap() {
+                        in0.replace(in0_out);
+                        in1.replace(in1_out);
+                    } else {
+                        unreachable!()
+                    }
+                }
+                yosys_parse::CellType::Or => {
+                    let in0_out = nodes.get(&in_ids[0]).map_or(
+                        input[input.binary_search_by_key(&in_ids[0], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    let in1_out = nodes.get(&in_ids[1]).map_or(
+                        input[input.binary_search_by_key(&in_ids[1], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    if let CircuitNode::OrNode(in0, in1, _) = nodes.get_mut(&out_id).unwrap() {
+                        in0.replace(in0_out);
+                        in1.replace(in1_out);
+                    } else {
+                        unreachable!()
+                    }
+                }
+                yosys_parse::CellType::Nor => {
+                    let in0_out = nodes.get(&in_ids[0]).map_or(
+                        input[input.binary_search_by_key(&in_ids[0], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    let in1_out = nodes.get(&in_ids[1]).map_or(
+                        input[input.binary_search_by_key(&in_ids[1], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    if let CircuitNode::NorNode(in0, in1, _) = nodes.get_mut(&out_id).unwrap() {
+                        in0.replace(in0_out);
+                        in1.replace(in1_out);
+                    } else {
+                        unreachable!()
+                    }
+                }
+                yosys_parse::CellType::Xor => {
+                    let in0_out = nodes.get(&in_ids[0]).map_or(
+                        input[input.binary_search_by_key(&in_ids[0], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    let in1_out = nodes.get(&in_ids[1]).map_or(
+                        input[input.binary_search_by_key(&in_ids[1], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    if let CircuitNode::XorNode(in0, in1, _) = nodes.get_mut(&out_id).unwrap() {
+                        in0.replace(in0_out);
+                        in1.replace(in1_out);
+                    } else {
+                        unreachable!()
+                    }
+                }
+                yosys_parse::CellType::Nxor => {
+                    let in0_out = nodes.get(&in_ids[0]).map_or(
+                        input[input.binary_search_by_key(&in_ids[0], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    let in1_out = nodes.get(&in_ids[1]).map_or(
+                        input[input.binary_search_by_key(&in_ids[1], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    if let CircuitNode::NxorNode(in0, in1, _) = nodes.get_mut(&out_id).unwrap() {
+                        in0.replace(in0_out);
+                        in1.replace(in1_out);
+                    } else {
+                        unreachable!()
+                    }
+                }
+                yosys_parse::CellType::Not => {
+                    let in0_out = nodes.get(&in_ids[0]).map_or(
+                        input[input.binary_search_by_key(&in_ids[0], |(a, _)| *a).unwrap()]
+                            .1
+                            .get_out(),
+                        |a| a.out_wire(),
+                    );
+                    if let CircuitNode::NotNode(in0, _) = nodes.get_mut(&out_id).unwrap() {
+                        in0.replace(in0_out);
+                    } else {
+                        unreachable!()
+                    }
+                }
             }
+        }
+        for out_id in output_id {
+            output.push((out_id, nodes.get(&out_id).unwrap().out_wire()));
+        }
+        output.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap());
 
-            /*             let graph = TaskGraph::new();
-                        let mem = Vec::with_capacity(n);
-                        mem.set_len(n);
-                        for (name, cell) in module.cells.iter() {
-                            let out_id = cell.output_wireid() as usize;
-                            let in_ids = cell.input_wireids();
-                            match cell.type_name {
-                                yosys_parse::CellType::And => {
-                                    let node = nodes[out_id];
-                                    let index = graph.add_task(
-                                        &[],
-                                        Box::pin(async move {
-                                            node.culc();
-                                        }),
-                                    ).ok()?;
-                                },
-                                yosys_parse::CellType::Nand => todo!(),
-                                yosys_parse::CellType::Or => todo!(),
-                                yosys_parse::CellType::Nor => todo!(),
-                                yosys_parse::CellType::Xor => todo!(),
-                                yosys_parse::CellType::Nxor => todo!(),
-                                yosys_parse::CellType::Not => todo!(),
-                            }
-                        }
-            */
-            Some(Circuit {
-                input,
-                output,
-                //executer: graph,
+        let mut graph = TaskGraph::new();
+        let mut mem = HashMap::new();
+        fn culc_<U: LogicOps + Send + Sync + 'static>(
+            node: CircuitNode<U>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                node.culc().unwrap();
             })
         }
+        for (out_id, node) in nodes.into_iter() {
+            let index = graph.add_task(culc_(node)).ok()?;
+            mem.insert(out_id, index);
+        }
+        for (_, cell) in module.cells.iter() {
+            let out_id = cell.output_wireid();
+            let in_ids = cell.input_wireids();
+            match cell.type_name {
+                yosys_parse::CellType::And
+                | yosys_parse::CellType::Nand
+                | yosys_parse::CellType::Or
+                | yosys_parse::CellType::Nor
+                | yosys_parse::CellType::Xor
+                | yosys_parse::CellType::Nxor => {
+                    let index_out = mem.get(&out_id).unwrap();
+                    if let Some(index_in0) = mem.get(&in_ids[0]) {
+                        graph.add_deps(&[index_in0.clone()], &index_out).ok()?;
+                    }
+                    if let Some(index_in1) = mem.get(&in_ids[1]) {
+                        graph.add_deps(&[index_in1.clone()], &index_out).ok()?;
+                    }
+                }
+                yosys_parse::CellType::Not => {
+                    let index_out = mem.get(&out_id).unwrap();
+                    if let Some(index_in0) = mem.get(&in_ids[0]) {
+                        graph.add_deps(&[index_in0.clone()], &index_out).ok()?;
+                    }
+                }
+            }
+        }
+
+        Some(Circuit {
+            input,
+            output,
+            engine: graph,
+        })
     }
 }
 
@@ -262,6 +356,11 @@ impl<T> WireOut<T> {
     pub fn read(&self) -> Result<RwLockReadGuard<Option<Box<T>>>, &'static str> {
         self.0.read().map_err(|_| "lock poisond")
     }
+
+    pub fn read_and_clear(&mut self) -> Result<Option<Box<T>>, &'static str> {
+        let mut lock = self.0.try_write().map_err(|_| "lock error")?;
+        Ok(lock.take())
+    }
     pub fn is_empty(&self) -> bool {
         self.read().expect("poisoned").is_none()
     }
@@ -280,7 +379,6 @@ pub enum CircuitNode<T> {
     NxorNode(Option<WireOut<T>>, Option<WireOut<T>>, WireIn<T>),
     XorNode(Option<WireOut<T>>, Option<WireOut<T>>, WireIn<T>),
     NotNode(Option<WireOut<T>>, WireIn<T>),
-    PortNode(WireIn<T>),
 }
 impl<T> CircuitNode<T> {
     pub fn out_wire(&self) -> WireOut<T> {
@@ -288,11 +386,10 @@ impl<T> CircuitNode<T> {
             CircuitNode::NandNode(_, _, out) => out.get_out(),
             CircuitNode::AndNode(_, _, out) => out.get_out(),
             CircuitNode::NorNode(_, _, out) => out.get_out(),
-            CircuitNode::OrNode(_, _,out) => out.get_out(),
+            CircuitNode::OrNode(_, _, out) => out.get_out(),
             CircuitNode::NxorNode(_, _, out) => out.get_out(),
             CircuitNode::XorNode(_, _, out) => out.get_out(),
             CircuitNode::NotNode(_, out) => out.get_out(),
-            CircuitNode::PortNode(out) => out.get_out(),
         }
     }
     #[inline]
@@ -355,88 +452,8 @@ impl<T> CircuitNode<T> {
             CircuitNode::NotNode(input, out) => {
                 Self::culc_mono_ops_(check(input)?, out, T::lgc_not)
             }
-            CircuitNode::PortNode(_) => Ok(()),
         }
     }
-    /*
-        #[inline]
-        fn culc_async_binary_ops(
-            rhs: &mut Option<WireOut<T>>,
-            lhs: &mut Option<WireOut<T>>,
-            out: &WireIn<T>,
-            f: fn(&T, &T) -> T,
-        ) -> BoxFuture<()>
-        where
-            T: LogicOps + Send + Sync + 'static,
-        {
-            Box::pin(
-                async {
-                    let rhs = rhs.as_mut().ok_or("connection less").unwrap();
-                    let lhs = lhs.as_mut().ok_or("connection less").unwrap();
-                    let rhs_ref = rhs.read_on_updated().await.unwrap();
-                    let lhs_ref = lhs.read_on_updated().await.unwrap();
-                    let rhs = rhs_ref.as_ref().unwrap();
-                    let lhs = lhs_ref.as_ref().unwrap();
-                    let res = f(rhs, lhs);
-                    out.write(Box::new(res)).map_err(|_| "errored").unwrap();
-                }
-            )
-        }
-
-        #[inline]
-        fn culc_async_mono_ops(
-            input: &mut Option<WireOut<T>>,
-            out: &WireIn<T>,
-            f: fn(&T) -> T,
-        ) -> BoxFuture<()>
-        where
-            T: LogicOps + Send + Sync + 'static,
-        {
-            Box::pin(
-                async {
-                    let input = input.as_mut().ok_or("connection less").unwrap();
-                    let input_ref = input.read_on_updated().await.unwrap();
-                    let input = input_ref.as_ref().unwrap();
-                    let res = f(input);
-                    out.write(Box::new(res)).map_err(|_| "errored").unwrap();
-                }
-            )
-        }
-        pub fn culc_async(mut self) -> BoxFuture<()>
-        where
-            T: LogicOps + Send + Sync + 'static,
-        {
-            fn check_connection<'a,'b,U>(lhs:&'a mut Option<WireOut<U>>,rhs:&'b mut Option<WireOut<U>>) -> (&'a mut WireOut<U>,&'b mut WireOut<U>) {
-                let rhs = rhs.as_mut().ok_or("connection less").unwrap();
-                let lhs = lhs.as_mut().ok_or("connection less").unwrap();
-                (lhs,rhs)
-            }
-            match self {
-                CircuitNode::NandNode(rhs, lhs, out) => {
-                    Self::culc_async_binary_ops(&mut rhs, &mut lhs, &out, T::lgc_nand)
-
-                }
-                CircuitNode::AndNode(rhs, lhs, out) => {
-                    Self::culc_async_binary_ops(&mut rhs, &mut lhs, &out, T::lgc_an)
-                }
-                CircuitNode::NorNode(rhs, lhs, out) => {
-                    Self::culc_async_binary_ops(&mut rhs, &mut lhs, &out, T::lgc_nor)
-                }
-                CircuitNode::OrNode(rhs, lhs, out) => {
-                    Self::culc_async_binary_ops(&mut rhs, &mut lhs, &out, T::lgc_or)
-                }
-                CircuitNode::NxorNode(rhs, lhs, out) => {
-                    Self::culc_async_binary_ops(&mut rhs, &mut lhs, &out, T::lgc_nxor)
-                }
-                CircuitNode::XorNode(rhs, lhs, out) => {
-                    Self::culc_async_binary_ops(&mut rhs, &mut lhs, &out, T::lgc_xor)
-                }
-                CircuitNode::NotNode(input, out) => {
-                    Self::culc_async_mono_ops(&mut input, &out, T::lgc_not)
-                }
-                CircuitNode::PortNode(_) => {},
-            }
-        }
     }
 
     #[cfg(test)]
@@ -445,53 +462,8 @@ impl<T> CircuitNode<T> {
         use std::thread::sleep;
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-        async fn tokio_watch_sample() {
-            let (tx, mut rx) = tokio::sync::watch::channel("hello");
+        async fn from_yosys_test() {
+            
 
-            let mut rx2 = rx.clone();
-            let t = tokio::task::spawn(async move {
-                let mut buffer = String::new();
-                while rx.changed().await.is_ok() {
-                    if (*rx.borrow()).starts_with("end") {
-                        break;
-                    }
-                    buffer.push_str(*rx.borrow());
-                }
-                buffer
-            });
-            let s = tokio::task::spawn(async move {
-                let mut buffer = String::new();
-                while rx2.changed().await.is_ok() {
-                    if (*rx2.borrow()).starts_with("endl") {
-                        break;
-                    }
-                    buffer.push_str(*rx2.borrow());
-                }
-                buffer
-            });
-
-            let dur: u64 = 10;
-
-            let res = tx.send("world");
-            sleep(std::time::Duration::from_millis(dur));
-            let _ = tx.send("a");
-            sleep(std::time::Duration::from_millis(dur));
-            let _ = tx.send("h");
-            sleep(std::time::Duration::from_millis(dur));
-            let _ = tx.send("o");
-            sleep(std::time::Duration::from_millis(dur));
-            let _ = tx.send("end");
-            sleep(std::time::Duration::from_millis(dur));
-            let _ = tx.send("endl");
-
-            match t.await {
-                Ok(s) => println!("res = {}", s),
-                Err(_) => {}
-            };
-            match s.await {
-                Ok(s) => println!("res = {}", s),
-                Err(_) => {}
-            };
         }
-        */
 }
